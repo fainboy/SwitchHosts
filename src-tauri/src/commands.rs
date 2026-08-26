@@ -661,6 +661,31 @@ pub async fn apply_hosts_selection<R: Runtime>(
         }
     };
 
+    match apply_aggregated_content(&app, state.inner(), &content).await {
+        Ok(outcome) => Ok(json!({
+            "success": true,
+            "old_content": outcome.previous_content,
+            "new_content": outcome.new_content,
+        })),
+        Err(ApplyPipelineError::Apply(e)) => Ok(e.into_renderer_value()),
+    }
+}
+
+/// Everything an apply entails beyond the raw write: the privileged
+/// write itself, the apply-history journal, the `system_hosts_updated`
+/// broadcast, the tray title refresh and `cmd_after_hosts_apply`.
+///
+/// Extracted so callers that bypass the renderer — currently the HTTP
+/// API when no window is alive to run `onToggleItem` — get the same
+/// pipeline as a UI-driven apply instead of a bare write that silently
+/// skips history and the post-apply command. Note the tray refresh here
+/// reads manifest.json from disk, so a caller that persists the tree
+/// afterwards must refresh again once the new tree has landed.
+pub(crate) async fn apply_aggregated_content<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    content: &str,
+) -> Result<hosts_apply::write::ApplyOutcome, ApplyPipelineError> {
     let (write_mode, history_limit, cmd_after_apply) = {
         let cfg = state.config.lock().expect("config mutex poisoned");
         (
@@ -674,14 +699,31 @@ pub async fn apply_hosts_selection<R: Runtime>(
     // user at the OS auth prompt) and *must not* hold the store_lock —
     // see implementation-notes A5. We do all the work outside the lock
     // and only retake it for the history journal write below.
-    let outcome = match hosts_apply::apply_to_system_hosts(&content, &write_mode) {
-        Ok(o) => o,
-        Err(HostsApplyError::Cancelled) => {
-            return Ok(HostsApplyError::Cancelled.into_renderer_value());
+    // Off the async workers: the privileged write blocks on an OS auth
+    // prompt for as long as the user takes, and on macOS it also holds a
+    // std mutex while doing so. Awaiting that inline would pin a worker
+    // of the runtime shared by the HTTP server and every async command.
+    let write_result = {
+        let content = content.to_string();
+        let write_mode = write_mode.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            hosts_apply::apply_to_system_hosts(&content, &write_mode)
+        })
+        .await
+    };
+    let outcome = match write_result {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            if !matches!(e, HostsApplyError::Cancelled) {
+                log::warn!("apply failed: {e}");
+            }
+            return Err(ApplyPipelineError::Apply(e));
         }
         Err(e) => {
-            log::warn!("apply failed: {e}");
-            return Ok(e.into_renderer_value());
+            log::warn!("apply task failed to run: {e}");
+            return Err(ApplyPipelineError::Apply(HostsApplyError::Io {
+                message: format!("apply task failed to run: {e}"),
+            }));
         }
     };
 
@@ -729,7 +771,7 @@ pub async fn apply_hosts_selection<R: Runtime>(
     // Push the freshest tray title to the menubar without waiting on
     // the renderer to call `update_tray_title` — the user expects to
     // see the title flip immediately after an apply.
-    if let Err(e) = tray::refresh_title(&app, state.inner()) {
+    if let Err(e) = tray::refresh_title(app, state) {
         log::warn!("failed to refresh tray title: {e}");
     }
 
@@ -754,11 +796,14 @@ pub async fn apply_hosts_selection<R: Runtime>(
         }
     }
 
-    Ok(json!({
-        "success": true,
-        "old_content": outcome.previous_content,
-        "new_content": outcome.new_content,
-    }))
+    Ok(outcome)
+}
+
+/// Failure modes of [`apply_aggregated_content`]. Currently only wraps
+/// the write itself; kept as an enum so later stages can surface their
+/// own errors without changing every call site.
+pub(crate) enum ApplyPipelineError {
+    Apply(HostsApplyError),
 }
 
 // ---- privileged helper (macOS SMAppService) --------------------------------
