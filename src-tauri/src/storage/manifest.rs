@@ -224,3 +224,419 @@ pub fn collect_content_ids(nodes: &[Value], out: &mut Vec<String>) {
         }
     }
 }
+
+// ---- selection state -------------------------------------------------------
+//
+// Port of `setOnStateOfItem` in `src/common/hostsFn.ts`. The renderer owns
+// this logic for UI-driven toggles; the HTTP API needs the same semantics
+// when no window — and therefore no renderer — is loaded, which is the
+// normal state under `hide_at_launch`.
+//
+// Nodes are addressed by index path rather than by `&mut` handles so a
+// child and its ancestors can be touched in one pass without fighting the
+// borrow checker.
+
+/// Index path from the root forest down to `id`, or `None` if absent.
+fn path_of(nodes: &[Value], id: &str) -> Option<Vec<usize>> {
+    for (i, node) in nodes.iter().enumerate() {
+        if node_id(node) == Some(id) {
+            return Some(vec![i]);
+        }
+        if let Some(children) = node_children(node) {
+            if let Some(mut sub) = path_of(children, id) {
+                let mut path = vec![i];
+                path.append(&mut sub);
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn node_at<'a>(nodes: &'a [Value], path: &[usize]) -> Option<&'a Value> {
+    let (first, rest) = path.split_first()?;
+    let node = nodes.get(*first)?;
+    if rest.is_empty() {
+        return Some(node);
+    }
+    node_at(node_children(node)?, rest)
+}
+
+fn node_at_mut<'a>(nodes: &'a mut [Value], path: &[usize]) -> Option<&'a mut Value> {
+    let (first, rest) = path.split_first()?;
+    let node = nodes.get_mut(*first)?;
+    if rest.is_empty() {
+        return Some(node);
+    }
+    node_at_mut(node_children_mut(node)?, rest)
+}
+
+fn set_node_on(node: &mut Value, on: bool) {
+    if let Some(obj) = node.as_object_mut() {
+        obj.insert("on".to_string(), Value::Bool(on));
+    }
+}
+
+/// A folder's own choice mode. `0`/absent means "inherit the global
+/// `choice_mode`", matching the renderer's `parent.folder_mode || default`.
+fn folder_mode(node: &Value) -> Option<u64> {
+    node.get("folder_mode")
+        .and_then(Value::as_u64)
+        .filter(|mode| *mode != 0)
+}
+
+fn is_folder(node: &Value) -> bool {
+    node.get("type").and_then(Value::as_str) == Some("folder")
+}
+
+/// Cascade `on` to every descendant of a folder. Single-choice folders
+/// are left alone — their children are mutually exclusive by definition.
+fn switch_folder_child(node: &mut Value, on: bool) {
+    if !is_folder(node) || folder_mode(node) == Some(1) {
+        return;
+    }
+    let Some(children) = node_children_mut(node) else {
+        return;
+    };
+    for child in children.iter_mut() {
+        set_node_on(child, on);
+        switch_folder_child(child, on);
+    }
+}
+
+/// Walk up from `path`, keeping each ancestor folder's `on` in sync:
+/// turning a child off turns the parent off; turning one on marks the
+/// parent on only once every sibling is on.
+fn switch_item_parent_is_on(root: &mut Vec<Value>, path: &[usize], on: bool) {
+    if path.len() < 2 {
+        return; // top-level node: no parent to reconcile
+    }
+    let parent_path = &path[..path.len() - 1];
+    {
+        let Some(parent) = node_at_mut(root, parent_path) else {
+            return;
+        };
+        if folder_mode(parent) == Some(1) {
+            return;
+        }
+        if !on {
+            set_node_on(parent, false);
+        } else {
+            let all_on = node_children(parent)
+                .map(|children| {
+                    children
+                        .iter()
+                        .all(|c| c.get("on").and_then(Value::as_bool).unwrap_or(false))
+                })
+                .unwrap_or(false);
+            set_node_on(parent, all_on);
+        }
+    }
+    switch_item_parent_is_on(root, parent_path, on);
+}
+
+/// Set `id`'s on-state and apply the same folder/choice-mode rules the
+/// renderer applies, in place on the legacy-shaped root forest.
+///
+/// `default_choice_mode` is the global `choice_mode` config value (`1` =
+/// single choice). `multi_chose_folder_switch_all` mirrors the config flag
+/// of the same name: when set, toggling a folder cascades to its children
+/// and reconciles its ancestors.
+pub fn set_on_state_of_item(
+    root: &mut Vec<Value>,
+    id: &str,
+    on: bool,
+    default_choice_mode: u64,
+    multi_chose_folder_switch_all: bool,
+) {
+    let Some(path) = path_of(root, id) else {
+        return;
+    };
+    if let Some(node) = node_at_mut(root, &path) {
+        set_node_on(node, on);
+    }
+
+    let in_top_level = path.len() == 1;
+    if multi_chose_folder_switch_all {
+        if let Some(node) = node_at_mut(root, &path) {
+            switch_folder_child(node, on);
+        }
+        if !in_top_level {
+            switch_item_parent_is_on(root, &path, on);
+        }
+    }
+
+    // Turning something off never forces anything else on.
+    if !on {
+        return;
+    }
+
+    if in_top_level {
+        if default_choice_mode != 1 {
+            return;
+        }
+        let chosen = path[0];
+        for (i, node) in root.iter_mut().enumerate() {
+            if i == chosen {
+                continue;
+            }
+            set_node_on(node, false);
+            if multi_chose_folder_switch_all {
+                switch_folder_child(node, false);
+            }
+        }
+        return;
+    }
+
+    let parent_path = &path[..path.len() - 1];
+    let mode = node_at(root, parent_path)
+        .and_then(folder_mode)
+        .unwrap_or(default_choice_mode);
+    if mode != 1 {
+        return;
+    }
+    let chosen = *path.last().expect("path is non-empty");
+    let Some(parent) = node_at_mut(root, parent_path) else {
+        return;
+    };
+    let Some(children) = node_children_mut(parent) else {
+        return;
+    };
+    for (i, child) in children.iter_mut().enumerate() {
+        if i == chosen {
+            continue;
+        }
+        set_node_on(child, false);
+        if multi_chose_folder_switch_all {
+            switch_folder_child(child, false);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leaf(id: &str, on: bool) -> Value {
+        json!({ "id": id, "title": id, "type": "local", "on": on })
+    }
+
+    fn folder(id: &str, on: bool, mode: u64, children: Vec<Value>) -> Value {
+        json!({
+            "id": id, "title": id, "type": "folder", "on": on,
+            "folder_mode": mode, "children": children,
+        })
+    }
+
+    /// A folder that carries no `folder_mode` of its own.
+    fn folder_no_mode(id: &str, on: bool, children: Vec<Value>) -> Value {
+        json!({
+            "id": id, "title": id, "type": "folder", "on": on, "children": children,
+        })
+    }
+
+    fn on_of(root: &[Value], id: &str) -> bool {
+        let path = path_of(root, id).expect("node must exist");
+        node_at(root, &path)
+            .and_then(|n| n.get("on"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn sets_the_target_node_and_leaves_siblings_alone_in_multi_choice() {
+        let mut root = vec![leaf("a", false), leaf("b", true)];
+        set_on_state_of_item(&mut root, "a", true, 2, false);
+        assert!(on_of(&root, "a"));
+        assert!(on_of(&root, "b"), "multi-choice must not turn siblings off");
+    }
+
+    #[test]
+    fn single_choice_turns_other_top_level_nodes_off() {
+        let mut root = vec![leaf("a", false), leaf("b", true), leaf("c", true)];
+        set_on_state_of_item(&mut root, "a", true, 1, false);
+        assert!(on_of(&root, "a"));
+        assert!(!on_of(&root, "b"));
+        assert!(!on_of(&root, "c"));
+    }
+
+    #[test]
+    fn turning_off_never_switches_anything_else_on() {
+        let mut root = vec![leaf("a", true), leaf("b", false)];
+        set_on_state_of_item(&mut root, "a", false, 1, false);
+        assert!(!on_of(&root, "a"));
+        assert!(!on_of(&root, "b"));
+    }
+
+    #[test]
+    fn folder_toggle_cascades_to_children_when_switch_all_is_set() {
+        let mut root = vec![folder(
+            "f",
+            false,
+            2,
+            vec![leaf("c1", false), leaf("c2", false)],
+        )];
+        set_on_state_of_item(&mut root, "f", true, 2, true);
+        assert!(on_of(&root, "f"));
+        assert!(on_of(&root, "c1"));
+        assert!(on_of(&root, "c2"));
+    }
+
+    #[test]
+    fn single_choice_folder_does_not_cascade_to_its_children() {
+        let mut root = vec![folder("f", false, 1, vec![leaf("c1", false)])];
+        set_on_state_of_item(&mut root, "f", true, 2, true);
+        assert!(on_of(&root, "f"));
+        assert!(
+            !on_of(&root, "c1"),
+            "children of a single-choice folder are mutually exclusive, so a \
+             folder toggle must not switch them all on"
+        );
+    }
+
+    #[test]
+    fn turning_one_child_off_turns_the_parent_off() {
+        let mut root = vec![folder(
+            "f",
+            true,
+            2,
+            vec![leaf("c1", true), leaf("c2", true)],
+        )];
+        set_on_state_of_item(&mut root, "c1", false, 2, true);
+        assert!(!on_of(&root, "c1"));
+        assert!(on_of(&root, "c2"), "the other child stays on");
+        assert!(!on_of(&root, "f"), "parent follows its children off");
+    }
+
+    #[test]
+    fn parent_turns_on_only_once_every_child_is_on() {
+        let mut root = vec![folder(
+            "f",
+            false,
+            2,
+            vec![leaf("c1", false), leaf("c2", false)],
+        )];
+        set_on_state_of_item(&mut root, "c1", true, 2, true);
+        assert!(
+            !on_of(&root, "f"),
+            "one of two children on: parent stays off"
+        );
+        set_on_state_of_item(&mut root, "c2", true, 2, true);
+        assert!(on_of(&root, "f"), "all children on: parent turns on");
+    }
+
+    #[test]
+    fn folder_mode_overrides_the_global_choice_mode_for_its_children() {
+        // Global mode is multi-choice, but this folder is single-choice.
+        let mut root = vec![folder(
+            "f",
+            true,
+            1,
+            vec![leaf("c1", true), leaf("c2", false)],
+        )];
+        set_on_state_of_item(&mut root, "c2", true, 2, false);
+        assert!(on_of(&root, "c2"));
+        assert!(
+            !on_of(&root, "c1"),
+            "single-choice folder unsets the sibling"
+        );
+    }
+
+    #[test]
+    fn nested_folders_reconcile_all_the_way_up() {
+        let mut root = vec![folder(
+            "outer",
+            true,
+            2,
+            vec![folder("inner", true, 2, vec![leaf("c1", true)])],
+        )];
+        set_on_state_of_item(&mut root, "c1", false, 2, true);
+        assert!(!on_of(&root, "inner"));
+        assert!(
+            !on_of(&root, "outer"),
+            "the reconcile walk must not stop at the first parent"
+        );
+    }
+
+    #[test]
+    fn unknown_id_is_a_no_op() {
+        let mut root = vec![leaf("a", true)];
+        set_on_state_of_item(&mut root, "nope", false, 1, true);
+        assert!(on_of(&root, "a"));
+    }
+
+    #[test]
+    fn folder_without_its_own_mode_inherits_the_global_choice_mode() {
+        let mut root = vec![folder_no_mode(
+            "f",
+            true,
+            vec![leaf("c1", true), leaf("c2", false)],
+        )];
+        set_on_state_of_item(&mut root, "c2", true, 1, false);
+        assert!(on_of(&root, "c2"));
+        assert!(
+            !on_of(&root, "c1"),
+            "a folder with no mode of its own must fall back to the global \
+             choice_mode, so single choice still applies to its children"
+        );
+    }
+
+    #[test]
+    fn folder_mode_zero_inherits_the_global_choice_mode() {
+        // `0` is the renderer's "unset" value — `parent.folder_mode ||
+        // defaultChoiceMode` treats it as falsy.
+        let mut root = vec![folder(
+            "f",
+            true,
+            0,
+            vec![leaf("c1", true), leaf("c2", false)],
+        )];
+        set_on_state_of_item(&mut root, "c2", true, 1, false);
+        assert!(on_of(&root, "c2"));
+        assert!(
+            !on_of(&root, "c1"),
+            "folder_mode 0 means inherit, not multi-choice"
+        );
+    }
+
+    #[test]
+    fn single_choice_takes_the_children_of_the_folders_it_switches_off() {
+        let mut root = vec![
+            folder("f", true, 2, vec![leaf("c1", true), leaf("c2", true)]),
+            leaf("a", false),
+        ];
+        set_on_state_of_item(&mut root, "a", true, 1, true);
+        assert!(on_of(&root, "a"));
+        assert!(!on_of(&root, "f"));
+        assert!(
+            !on_of(&root, "c1") && !on_of(&root, "c2"),
+            "switching a top-level folder off under single choice must cascade to its children"
+        );
+    }
+
+    #[test]
+    fn a_single_choice_folder_does_not_follow_its_children_off() {
+        // Its children are mutually exclusive, so the folder's own state is
+        // not derived from them — the parent reconcile walk skips it.
+        let mut root = vec![folder(
+            "f",
+            true,
+            1,
+            vec![leaf("c1", true), leaf("c2", false)],
+        )];
+        set_on_state_of_item(&mut root, "c1", false, 2, true);
+        assert!(!on_of(&root, "c1"));
+        assert!(on_of(&root, "f"));
+    }
+
+    #[test]
+    fn only_folders_cascade_even_if_another_node_type_carries_children() {
+        let mut root = vec![json!({
+            "id": "l", "title": "l", "type": "local", "on": false,
+            "children": [ leaf("c1", false) ],
+        })];
+        set_on_state_of_item(&mut root, "l", true, 2, true);
+        assert!(on_of(&root, "l"));
+        assert!(!on_of(&root, "c1"));
+    }
+}
